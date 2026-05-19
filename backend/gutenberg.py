@@ -7,43 +7,40 @@ import requests
 
 
 AUTHOR_BOOKS = {
-    'Jane Austen':        [1342, 161, 121],
-    'Charles Dickens':    [98,   1400, 730],
-    'Mark Twain':         [74,   76,   86],
-    'Oscar Wilde':        [174,  854,  333],
+    'Jane Austen':        [1342, 161, 121, 105, 946, 31100],  # added Northanger Abbey
+    'Charles Dickens':    [98,   1400, 730, 1023],
+    'Mark Twain':         [74,   76,   86,  3176],
+    'Oscar Wilde':        [174,  854,  333, 790, 887],
     'Virginia Woolf':     [5670, 144,  4476],
     'Edgar Allan Poe':    [2147, 932,  25525],
-    'Arthur Conan Doyle': [1661, 2097, 108],
+    'Arthur Conan Doyle': [1661, 2097, 108,  2343],
 }
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 CHUNK_SIZE   = 500   # words per training chunk
 SLEEP_DELAY  = 2.0   # seconds between Gutenberg requests — do not lower this
-GUTENBERG_URL = "https://www.gutenberg.org/cache/epub/{id}/pg{id}.txt"
+
+
+GUTENBERG_FALLBACK_URLS = [
+    "https://www.gutenberg.org/cache/epub/{id}/pg{id}.txt",
+    "https://www.gutenberg.org/files/{id}/{id}-0.txt",
+    "https://www.gutenberg.org/files/{id}/{id}.txt",
+]
 
 
 def fetch_raw_text(book_id: int) -> str | None:
-    """
-    Downloads a single book from Gutenberg by its numeric ID.
-    Returns the raw text string, or None if the request fails.
-
-    Common mistake: Gutenberg sometimes uses a mirror URL format.
-    If this URL pattern fails for a specific book, the fallback
-    URL pattern is: https://www.gutenberg.org/files/{id}/{id}-0.txt
-    """
-    url = GUTENBERG_URL.format(id=book_id)
-    try:
-        # stream=False is fine — books are only a few MB at most
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()  # raises exception for 4xx/5xx status codes
-
-        # Gutenberg files are utf-8 but sometimes have latin-1 fallback
-        # This handles both without crashing
-        return response.content.decode('utf-8', errors='replace')
-
-    except requests.RequestException as e:
-        print(f"  [!] Failed to fetch book {book_id}: {e}")
-        return None
+    for url_template in GUTENBERG_FALLBACK_URLS:
+        url = url_template.format(id=book_id)
+        for attempt in range(3):
+            try:
+                response = requests.get(url, timeout=60)
+                response.raise_for_status()
+                return response.content.decode('utf-8', errors='replace')
+            except requests.RequestException as e:
+                print(f"  [!] Attempt {attempt+1} failed: {e}")
+                time.sleep(5 * (attempt + 1))
+    print(f"  [!] All URLs failed for book {book_id}")
+    return None
 
 
 def strip_gutenberg_boilerplate(text: str) -> str:
@@ -147,61 +144,45 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-def fetch_author_chunks(author: str, book_ids: list[int]) -> list[str]:
-    """
-    For a given author, fetches all their books, cleans them,
-    and returns a flat list of ~500-word text chunks.
-
-    This is the main function called by train.py.
-
-    Returns a list of strings — each string is one training sample.
-    """
+def fetch_author_chunks(author: str, book_ids: list[int]) -> list[tuple[str, int]]:
+    """Returns list of (chunk_text, book_id) tuples"""
     all_chunks = []
-
     print(f"\n[{author}]")
-
     for book_id in book_ids:
         print(f"  Fetching book ID {book_id}...", end=' ')
-
         raw = fetch_raw_text(book_id)
         if raw is None:
-            continue  # skip this book, try the next one
-
-        # Strip Gutenberg boilerplate
+            continue
         stripped = strip_gutenberg_boilerplate(raw)
-
-        # Light cleaning
-        cleaned = clean_text(stripped)
-
-        # Chunk into ~500 word blocks
-        chunks = chunk_text(cleaned)
-
+        cleaned  = clean_text(stripped)
+        chunks   = chunk_text(cleaned)
         print(f"got {len(chunks)} chunks")
-        all_chunks.extend(chunks)
-
-        # Be polite to Gutenberg's servers
-        # Common mistake: forgetting this — your IP will get rate limited
+        for chunk in chunks:
+            all_chunks.append((chunk, book_id))
         time.sleep(SLEEP_DELAY)
-
     print(f"  Total chunks for {author}: {len(all_chunks)}")
     return all_chunks
 
 
-def fetch_all_authors() -> dict[str, list[str]]:
-    """
-    Fetches chunks for every author in AUTHOR_BOOKS.
-    Returns a dict: { author_name: [chunk1, chunk2, ...] }
-
-    This is what train.py calls once to get all training data.
-    """
+def fetch_all_authors() -> dict[str, list[tuple[str, int]]]:
     all_data = {}
-
     for author, book_ids in AUTHOR_BOOKS.items():
         chunks = fetch_author_chunks(author, book_ids)
         if chunks:
             all_data[author] = chunks
         else:
-            print(f"  [!] No chunks retrieved for {author} — skipping")
+            print(f"  [!] No chunks for {author} — skipping")
+
+    # Cap all authors to the same chunk count to eliminate class imbalance
+    MAX_CHUNKS_PER_AUTHOR = 500
+    all_data = {
+        author: chunks[:MAX_CHUNKS_PER_AUTHOR]
+        for author, chunks in all_data.items()
+    }
+
+    print("\nChunk counts after capping:")
+    for author, chunks in all_data.items():
+        print(f"  {author:<25} {len(chunks)} chunks")
 
     return all_data
 
